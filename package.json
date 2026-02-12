@@ -15,6 +15,7 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
+    "@supabase/supabase-js": "^2.95.3",
     "dexie": "^4.3.0",
     "preact": "^10.28.3"
   },

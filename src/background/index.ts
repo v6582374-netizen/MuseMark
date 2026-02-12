@@ -1,4 +1,5 @@
 import Dexie, { type Table } from "dexie";
+import { createClient, type SupportedStorage } from "@supabase/supabase-js";
 import { PROTOCOL_VERSION, type MessageEnvelope, type RuntimeResponse } from "../shared/messages";
 import { DEFAULT_SETTINGS, getSettingsFromStorage, saveSettingsToStorage } from "../shared/settings";
 import type {
@@ -464,12 +465,20 @@ async function routeRuntimeMessage(message: MessageEnvelope, sender: chrome.runt
 
     case "settings/save": {
       const incoming = message.payload as Partial<ExtensionSettings>;
-      const merged = { ...(await getSettingsFromStorage()), ...incoming };
+      const current = await getSettingsFromStorage();
+      const merged = { ...current, ...incoming };
+      await requestNetworkPermissionsForSettings(current, merged);
       return saveSettingsToStorage(merged);
     }
 
     case "settings/test":
       return testAiConnection();
+
+    case "permissions/requestOrigin":
+      return await requestOriginPermission((message.payload as { url?: string; reason?: string }) ?? {});
+
+    case "permissions/checkOrigin":
+      return await checkOriginPermission((message.payload as { url?: string }) ?? {});
 
     case "auth/getState":
       return getAuthState();
@@ -2498,6 +2507,10 @@ async function callChatRaw(
   settings: ExtensionSettings,
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>
 ): Promise<string> {
+  await ensureUrlPermission(settings.baseUrl, {
+    reason: "AI service",
+    requestIfMissing: false
+  });
   const endpoint = resolveChatCompletionsEndpoint(settings.baseUrl);
   const response = await fetch(endpoint, {
     method: "POST",
@@ -2540,6 +2553,10 @@ async function callChatRaw(
 }
 
 async function generateEmbedding(settings: ExtensionSettings, text: string): Promise<number[]> {
+  await ensureUrlPermission(settings.baseUrl, {
+    reason: "AI service",
+    requestIfMissing: false
+  });
   const endpoint = resolveEmbeddingsEndpoint(settings.baseUrl);
   const response = await fetch(endpoint, {
     method: "POST",
@@ -2935,38 +2952,57 @@ async function signInOAuth(provider: "google"): Promise<{ state: AuthState }> {
 
   const settings = await getSettingsFromStorage();
   assertSupabaseConfigured(settings);
-
-  const pendingState = crypto.randomUUID();
-  const pendingNonce = crypto.randomUUID();
-  await persistPendingBridgeState(pendingState, pendingNonce);
+  await ensureUrlPermission(settings.supabaseUrl, {
+    reason: "Supabase",
+    requestIfMissing: false
+  });
 
   try {
     const redirectUri = chrome.identity.getRedirectURL("auth-callback");
-    const authUrl = new URL(resolveSupabaseEndpoint(settings.supabaseUrl, "/auth/v1/authorize"));
-    authUrl.searchParams.set("provider", provider);
-    authUrl.searchParams.set("redirect_to", redirectUri);
-    authUrl.searchParams.set("state", pendingState);
-    authUrl.searchParams.set("nonce", pendingNonce);
-    authUrl.searchParams.set("scopes", "openid email profile");
+    const pkceStorage = createMemoryStorage();
+    const supabase = createSupabaseAuthClient(settings, pkceStorage);
+    const oauthResponse = await supabase.auth.signInWithOAuth({
+      provider,
+      options: {
+        redirectTo: redirectUri,
+        scopes: "openid email profile",
+        skipBrowserRedirect: true
+      }
+    });
 
-    const redirectedTo = await launchOAuthFlow(authUrl.toString());
-    const result = parseOAuthResult(redirectedTo);
-    if (result.errorDescription) {
-      throw new Error(result.errorDescription);
+    if (oauthResponse.error) {
+      throw new Error(oauthResponse.error.message);
     }
-    validatePendingState(result.state, pendingState, result.nonce, pendingNonce);
+    const authUrl = oauthResponse.data.url;
+    if (!authUrl) {
+      throw new Error("Supabase OAuth did not return authorize URL.");
+    }
 
-    if (!result.accessToken) {
-      throw new Error("OAuth succeeded but no access token was returned.");
+    const redirectedTo = await launchOAuthFlow(authUrl);
+    const result = parseOAuthResult(redirectedTo);
+    if (result.errorDescription || result.error) {
+      throw new Error(result.errorDescription || result.error);
+    }
+
+    if (!result.code) {
+      throw new Error("OAuth succeeded but no authorization code was returned.");
+    }
+
+    const exchanged = await supabase.auth.exchangeCodeForSession(result.code);
+    if (exchanged.error) {
+      throw new Error(exchanged.error.message);
+    }
+    const exchangedSession = exchanged.data.session;
+    if (!exchangedSession?.access_token) {
+      throw new Error("Code exchange succeeded but no access token was returned.");
     }
 
     const session = await buildSessionFromTokenResult(
       settings,
       {
-        accessToken: result.accessToken,
-        refreshToken: result.refreshToken,
-        expiresAt: result.expiresAt,
-        expiresIn: result.expiresIn
+        accessToken: exchangedSession.access_token,
+        refreshToken: exchangedSession.refresh_token,
+        expiresIn: exchangedSession.expires_in
       },
       provider
     );
@@ -2992,15 +3028,16 @@ async function signInOAuth(provider: "google"): Promise<{ state: AuthState }> {
       state: await getAuthState()
     };
   } catch (error) {
+    const friendly = toFriendlyAuthError(toErrorMessage(error));
     await saveAuthStorageState({
       ...(await getAuthStorageState()),
       syncStatus: "error",
-      lastError: toErrorMessage(error),
+      lastError: friendly,
       pendingState: undefined,
       pendingNonce: undefined,
       pendingStateExpiresAt: undefined
     });
-    throw error;
+    throw new Error(friendly);
   }
 }
 
@@ -3012,6 +3049,11 @@ async function sendMagicLink(email: string): Promise<{ sent: boolean; hint: stri
 
   const settings = await getSettingsFromStorage();
   assertSupabaseConfigured(settings);
+  assertAuthBridgeConfigured(settings);
+  await ensureUrlPermission(settings.supabaseUrl, {
+    reason: "Supabase",
+    requestIfMissing: false
+  });
 
   const pendingState = crypto.randomUUID();
   const pendingNonce = crypto.randomUUID();
@@ -3060,6 +3102,10 @@ async function signOut(): Promise<void> {
   const accessToken = auth.session?.accessToken;
   if (settings.supabaseUrl && settings.supabaseAnonKey && accessToken) {
     try {
+      await ensureUrlPermission(settings.supabaseUrl, {
+        reason: "Supabase",
+        requestIfMissing: false
+      });
       await fetch(resolveSupabaseEndpoint(settings.supabaseUrl, "/auth/v1/logout"), {
         method: "POST",
         headers: {
@@ -3092,6 +3138,7 @@ async function handleBridgeCompleteMessage(
 ): Promise<{ state: AuthState }> {
   const settings = await getSettingsFromStorage();
   assertSupabaseConfigured(settings);
+  assertAuthBridgeConfigured(settings);
   ensureBridgeSenderAllowed(settings, sender);
 
   const auth = await getAuthStorageState();
@@ -3525,6 +3572,10 @@ async function deleteCloudRowsForBookmarks(items: BookmarkItem[]): Promise<void>
   params.set("dedupe_key", `in.(${keys.map((value) => `"${value.replace(/"/g, '\\"')}"`).join(",")})`);
 
   try {
+    await ensureUrlPermission(settings.supabaseUrl, {
+      reason: "Supabase",
+      requestIfMissing: false
+    });
     await fetch(resolveSupabaseEndpoint(settings.supabaseUrl, `/rest/v1/bookmarks?${params.toString()}`), {
       method: "DELETE",
       headers: {
@@ -3663,6 +3714,10 @@ async function requestSupabaseRest<T>(
   path: string,
   init: RequestInit
 ): Promise<T> {
+  await ensureUrlPermission(settings.supabaseUrl, {
+    reason: "Supabase",
+    requestIfMissing: false
+  });
   const response = await fetch(resolveSupabaseEndpoint(settings.supabaseUrl, path), {
     ...init,
     headers: {
@@ -3693,6 +3748,9 @@ function assertSupabaseConfigured(settings: ExtensionSettings): void {
   if (!settings.supabaseAnonKey.trim()) {
     throw new Error("Supabase anon key is missing. Set it in Options.");
   }
+}
+
+function assertAuthBridgeConfigured(settings: ExtensionSettings): void {
   if (!settings.authBridgeUrl.trim()) {
     throw new Error("Auth bridge URL is missing. Set it in Options.");
   }
@@ -3702,6 +3760,111 @@ function resolveSupabaseEndpoint(baseUrl: string, path: string): string {
   const cleanedBase = (baseUrl ?? "").trim().replace(/\/+$/, "");
   const cleanedPath = path.startsWith("/") ? path : `/${path}`;
   return `${cleanedBase}${cleanedPath}`;
+}
+
+async function requestNetworkPermissionsForSettings(
+  current: ExtensionSettings,
+  next: ExtensionSettings
+): Promise<void> {
+  const targets: Array<{ url: string; reason: string }> = [];
+  const baseOriginChanged = normalizeOrigin(current.baseUrl) !== normalizeOrigin(next.baseUrl);
+  const aiCredentialsChanged = current.apiKey !== next.apiKey;
+  if (next.baseUrl.trim() && (baseOriginChanged || aiCredentialsChanged || next.apiKey.trim().length > 0)) {
+    targets.push({ url: next.baseUrl, reason: "AI service" });
+  }
+  const supabaseOriginChanged = normalizeOrigin(current.supabaseUrl) !== normalizeOrigin(next.supabaseUrl);
+  const supabaseCredentialsChanged = current.supabaseAnonKey !== next.supabaseAnonKey;
+  if (
+    next.supabaseUrl.trim() &&
+    next.cloudSyncEnabled &&
+    (supabaseOriginChanged || supabaseCredentialsChanged || next.supabaseAnonKey.trim().length > 0)
+  ) {
+    targets.push({ url: next.supabaseUrl, reason: "Supabase" });
+  }
+
+  for (const target of targets) {
+    await ensureUrlPermission(target.url, {
+      reason: target.reason,
+      requestIfMissing: true
+    });
+  }
+}
+
+async function requestOriginPermission(payload: { url?: string; reason?: string }): Promise<{ granted: boolean; origin?: string }> {
+  const pattern = toOriginPattern(payload.url);
+  if (!pattern) {
+    throw new Error("Invalid URL. Please use a full https:// domain.");
+  }
+  const granted = await ensureUrlPermission(payload.url ?? "", {
+    reason: payload.reason ?? "remote service",
+    requestIfMissing: true
+  });
+  return { granted, origin: pattern };
+}
+
+async function checkOriginPermission(payload: { url?: string }): Promise<{ granted: boolean; origin?: string }> {
+  const pattern = toOriginPattern(payload.url);
+  if (!pattern) {
+    return { granted: false };
+  }
+  return {
+    granted: await hasOriginPermission(pattern),
+    origin: pattern
+  };
+}
+
+async function ensureUrlPermission(
+  url: string,
+  input: {
+    reason: string;
+    requestIfMissing: boolean;
+  }
+): Promise<boolean> {
+  const pattern = toOriginPattern(url);
+  if (!pattern) {
+    throw new Error(`Invalid ${input.reason} URL: ${url}`);
+  }
+
+  const granted = await hasOriginPermission(pattern);
+  if (granted) {
+    return true;
+  }
+
+  if (!input.requestIfMissing) {
+    throw new Error(
+      `Missing permission for ${input.reason} origin ${pattern}. Open Options and save settings to grant access.`
+    );
+  }
+
+  const grantedByUser = await chrome.permissions.request({ origins: [pattern] });
+  if (!grantedByUser) {
+    throw new Error(`Permission for ${input.reason} origin ${pattern} was denied.`);
+  }
+
+  return true;
+}
+
+async function hasOriginPermission(originPattern: string): Promise<boolean> {
+  return chrome.permissions.contains({ origins: [originPattern] });
+}
+
+function toOriginPattern(url: string | undefined): string | undefined {
+  if (!url?.trim()) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(url.trim());
+    if (parsed.protocol !== "https:") {
+      return undefined;
+    }
+    return `${parsed.origin}/*`;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeOrigin(url: string | undefined): string {
+  return toOriginPattern(url) ?? "";
 }
 
 async function refreshAuthSessionIfNeeded(settings: ExtensionSettings, session: AuthSession): Promise<AuthSession> {
@@ -3718,6 +3881,10 @@ async function refreshAuthSessionIfNeeded(settings: ExtensionSettings, session: 
     throw new Error("Session expired and refresh token is missing.");
   }
 
+  await ensureUrlPermission(settings.supabaseUrl, {
+    reason: "Supabase",
+    requestIfMissing: false
+  });
   const response = await fetch(resolveSupabaseEndpoint(settings.supabaseUrl, "/auth/v1/token?grant_type=refresh_token"), {
     method: "POST",
     headers: {
@@ -3781,6 +3948,10 @@ async function buildSessionFromTokenResult(
 }
 
 async function fetchSupabaseUser(settings: ExtensionSettings, accessToken: string, provider: AuthProvider): Promise<AuthSessionUser> {
+  await ensureUrlPermission(settings.supabaseUrl, {
+    reason: "Supabase",
+    requestIfMissing: false
+  });
   const response = await fetch(resolveSupabaseEndpoint(settings.supabaseUrl, "/auth/v1/user"), {
     method: "GET",
     headers: {
@@ -3866,48 +4037,71 @@ function decodeBase64Url(value: string): string {
 }
 
 function parseOAuthResult(urlValue: string): {
-  accessToken?: string;
-  refreshToken?: string;
-  expiresAt?: string;
-  expiresIn?: number;
+  code?: string;
   state?: string;
-  nonce?: string;
+  error?: string;
   errorDescription?: string;
 } {
   const parsed = new URL(urlValue);
   const hash = new URLSearchParams(parsed.hash.startsWith("#") ? parsed.hash.slice(1) : parsed.hash);
   const query = parsed.searchParams;
 
-  const accessToken = hash.get("access_token") || query.get("access_token") || undefined;
-  const refreshToken = hash.get("refresh_token") || query.get("refresh_token") || undefined;
-  const expiresAtRaw = hash.get("expires_at") || query.get("expires_at");
-  const expiresInRaw = hash.get("expires_in") || query.get("expires_in");
+  const code = query.get("code") || hash.get("code") || undefined;
   const state = hash.get("state") || query.get("state") || undefined;
-  const nonce = hash.get("nonce") || query.get("nonce") || undefined;
+  const error = hash.get("error") || query.get("error") || undefined;
   const errorDescription = hash.get("error_description") || query.get("error_description") || undefined;
 
-  const expiresAt = expiresAtRaw && /^\d+$/.test(expiresAtRaw) ? new Date(Number(expiresAtRaw) * 1000).toISOString() : undefined;
-  const expiresIn = expiresInRaw && /^\d+$/.test(expiresInRaw) ? Number(expiresInRaw) : undefined;
-
   return {
-    accessToken,
-    refreshToken,
-    expiresAt,
-    expiresIn,
+    code,
     state,
-    nonce,
+    error,
     errorDescription
   };
 }
 
+function createMemoryStorage(): SupportedStorage {
+  const store = new Map<string, string>();
+  return {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      store.set(key, value);
+    },
+    removeItem: (key: string) => {
+      store.delete(key);
+    }
+  };
+}
+
+function createSupabaseAuthClient(settings: ExtensionSettings, storage: SupportedStorage) {
+  return createClient(settings.supabaseUrl, settings.supabaseAnonKey, {
+    auth: {
+      flowType: "pkce",
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+      persistSession: false,
+      storage,
+      storageKey: `autonote-auth-${chrome.runtime.id}`
+    }
+  });
+}
+
 function launchOAuthFlow(url: string): Promise<string> {
   return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(
+        new Error(
+          "OAuth callback timed out. Verify Supabase redirect allowlist includes the Chrome redirect URL returned by chrome.identity.getRedirectURL()."
+        )
+      );
+    }, 120_000);
+
     chrome.identity.launchWebAuthFlow(
       {
         url,
         interactive: true
       },
       (redirectedTo) => {
+        clearTimeout(timeout);
         const lastError = chrome.runtime.lastError;
         if (lastError) {
           reject(new Error(lastError.message || "OAuth flow failed."));
@@ -4619,4 +4813,15 @@ function toErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error ?? "Unknown error");
+}
+
+function toFriendlyAuthError(message: string): string {
+  const lower = message.toLowerCase();
+  if (lower.includes("bad_oauth_state") || lower.includes("state not found or expired")) {
+    return "Google 登录失败：OAuth state 已失效。请重试；若仍失败，请在 Supabase 的 Redirect URLs 中加入 chrome.identity.getRedirectURL() 返回的地址。";
+  }
+  if (lower.includes("oauth callback timed out")) {
+    return "Google 登录超时：扩展没有收到回调地址。请检查 Supabase Redirect URLs 是否包含 chrome.identity.getRedirectURL() 的值。";
+  }
+  return message;
 }

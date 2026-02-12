@@ -1,12 +1,12 @@
 {
   "manifest_version": 3,
   "name": "AutoNote",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AI powered bookmark capture and classification workflow.",
-  "permissions": ["storage", "scripting", "activeTab", "commands", "notifications", "alarms", "identity"],
-  "host_permissions": ["https://*/*", "http://*/*"],
+  "permissions": ["storage", "scripting", "activeTab", "commands", "notifications", "alarms", "identity", "permissions"],
+  "optional_host_permissions": ["https://*/*"],
   "externally_connectable": {
-    "matches": ["https://bridge.autonote.app/*"]
+    "matches": ["https://auto-note.vercel.app/*"]
   },
   "background": {
     "service_worker": "background.js",

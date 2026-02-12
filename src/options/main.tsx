@@ -105,6 +105,7 @@ function App() {
               }
               placeholder="https://api.openai.com"
             />
+            <small>Saving settings will request runtime permission only for this domain.</small>
           </div>
 
           <div class="field full">
@@ -165,6 +166,7 @@ function App() {
               }
               placeholder="https://xxxx.supabase.co"
             />
+            <small>Cloud sync/auth uses runtime permission for this domain only.</small>
           </div>
 
           <div class="field full">
