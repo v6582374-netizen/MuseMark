@@ -339,15 +339,16 @@ function App() {
     }
   }
 
-  async function reloadItems(input?: { clarificationAnswer?: string; sessionId?: string }) {
+  async function reloadItems(input?: { clarificationAnswer?: string; sessionId?: string; queryOverride?: string }) {
     setLoading(true);
     setError("");
+    const searchQuery = (input?.queryOverride ?? debouncedQuery).trim();
 
     try {
-      if (debouncedQuery) {
+      if (searchQuery) {
         try {
           const response = await sendRuntimeMessage<SemanticSearchResponse>("manager/searchSemantic", {
-            query: debouncedQuery,
+            query: searchQuery,
             scope,
             limit: 120,
             clarificationAnswer: input?.clarificationAnswer,
@@ -387,7 +388,7 @@ function App() {
           }
           const response = await sendRuntimeMessage<{ items: BookmarkItem[] }>("manager/list", {
             scope,
-            search: debouncedQuery,
+            search: searchQuery,
             status: statusFilter,
             category: categoryFilter || undefined,
             tag: tagFilter || undefined,
@@ -450,6 +451,15 @@ function App() {
     await sendRuntimeMessage("quickDock/unpin", { bookmarkId: itemId });
     await reloadQuickDockState();
     setStatusHint("Removed from QuickDock");
+  }
+
+  async function handleSearchSubmit() {
+    await reloadItems({ queryOverride: query.trim() });
+  }
+
+  async function handleSearchBack() {
+    setQuery("");
+    await reloadItems({ queryOverride: "" });
   }
 
   async function handleSave(
@@ -705,6 +715,7 @@ function App() {
       trash
     };
   }, [statuses]);
+  const canReturnFromSearch = query.trim().length > 0 || hasActiveSearch;
 
   return (
     <div class="shell">
@@ -746,11 +757,20 @@ function App() {
             <input
               value={query}
               onInput={(event) => setQuery((event.currentTarget as HTMLInputElement).value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void handleSearchSubmit();
+                }
+              }}
               placeholder="Ask naturally: the AI agents benchmark article I saw last week"
             />
           </div>
-          <button class="btn" onClick={() => void reloadItems()}>
+          <button class="btn" onClick={() => void handleSearchSubmit()}>
             Search
+          </button>
+          <button class="btn" onClick={() => void handleSearchBack()} disabled={!canReturnFromSearch}>
+            Back
           </button>
           <button class="btn" onClick={() => setPaletteOpen(true)}>
             Cmd/Ctrl+K

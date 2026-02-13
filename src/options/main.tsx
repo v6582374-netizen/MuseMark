@@ -148,6 +148,23 @@ function App() {
     }
   }
 
+  async function handleUnpinFromSuggested(entry: DockEntry) {
+    if (entry.kind !== "bookmark") {
+      return;
+    }
+    setDockSuggestedEntries((current) => current.filter((candidate) => candidate.id !== entry.id));
+    try {
+      await sendRuntimeMessage("quickDock/dismiss", {
+        bookmarkId: entry.id,
+        days: 30
+      });
+      await reloadDockControlData();
+    } catch (error) {
+      setDockControlError(toErrorMessage(error));
+      await reloadDockControlData();
+    }
+  }
+
   async function handleOpenDockEntry(entry: DockEntry) {
     try {
       await sendRuntimeMessage("quickDock/open", {
@@ -696,6 +713,9 @@ function App() {
                       </button>
                       <button class="btn" type="button" onClick={() => void handlePinToDock(entry)}>
                         Pin
+                      </button>
+                      <button class="btn" type="button" onClick={() => void handleUnpinFromSuggested(entry)}>
+                        Unpin
                       </button>
                     </div>
                   </div>

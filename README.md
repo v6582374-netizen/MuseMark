@@ -84,9 +84,12 @@ MuseMark 的思路是把“保存-理解-组织-召回”串成一个闭环：
 - 视图：`Home(紧凑列表)`
 - 范围：`Inbox / Library / Trash`
 - 操作：编辑分类/标签/备注、重试 AI、回收站操作
+- 搜索交互：`Ask naturally` 支持回车执行搜索，支持 `Back` 快速返回默认列表
 - 命令面板：`Cmd/Ctrl + K`
 - 工具：embedding 回填、favicon 回填、导入导出、分类规则管理
 - Dock 入口：提供明显按钮跳转至 `Options` 的 Dock Control 页面
+
+![MuseMark Manager Preview](preview.jpg)
 
 ### 3) 语义检索与可解释排序
 
@@ -104,7 +107,7 @@ MuseMark 的思路是把“保存-理解-组织-召回”串成一个闭环：
 - 支持从 Dock 快速打开 Library 或保存当前页
 - 支持在 `Options` 中分区管理：
   - `Pinned to Dock`（手动 Pin 区）
-  - `Suggested for Dock`（算法推荐区）
+  - `Suggested for Dock`（算法推荐区，支持 Pin/Unpin）
 
 ### 5) 可选云同步与账号体系
 
