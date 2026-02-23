@@ -205,6 +205,7 @@ export interface ExtensionSettings {
   maxChars: number;
   quickDockEnabled: boolean;
   quickDockCollapsedByDefault: boolean;
+  quickDockPosition: "right" | "bottom_center";
   quickDockMaxItems: number;
   quickDockPinMode: "manual_first" | "manual_only";
   classificationMode: "by_type" | "by_content";

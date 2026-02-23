@@ -19,6 +19,7 @@ export const QUICKDOCK_MESSAGE_TYPES = {
   open: "quickDock/open",
   pin: "quickDock/pin",
   unpin: "quickDock/unpin",
+  reorderPinned: "quickDock/reorderPinned",
   dismiss: "quickDock/dismiss",
   saveCurrent: "quickDock/saveCurrent",
   updateLayout: "quickDock/updateLayout"

@@ -51,7 +51,7 @@ MuseMark 的思路是把“保存-理解-组织-召回”串成一个闭环：
 
 ## 阶段状态（Phase Snapshot）
 
-当前可视为 **v0.1.x 阶段（可内部使用/可提审）**，核心闭环已打通。
+当前可视为 **v0.1.1 阶段（2026-02，可内部使用/可提审）**，核心闭环已打通。
 
 | 模块 | 当前状态 | 说明 |
 | --- | --- | --- |
@@ -59,7 +59,9 @@ MuseMark 的思路是把“保存-理解-组织-召回”串成一个闭环：
 | AI 摘要与分类 | 完成 | 双阶段流程（analyze + classify），失败可回退/重试 |
 | 语义检索 | 完成 | lexical + semantic + taxonomy + recency 混合排序 |
 | 低置信度澄清 | 完成 | 模糊查询可触发澄清选项，二次排序 |
+| Manager 搜索体验 | 完成 | 搜索区升级为三段式（语义提示 + 主搜索 + 次操作），输入框更醒目，窄屏不再被按钮挤压 |
 | QuickDock | 完成 | 网页侧常驻入口，支持右侧竖向 / 底部居中横向切换；支持 pin/dismiss、Pinned 拖拽重排（Options + 页面 Dock）与数字快捷键；已完成关闭控件中轴对齐与瀑布流展开/收起动画 |
+| 构建稳定性（Content Script） | 完成 | 修复 content script 顶层模块引入导致的注入报错，确保 `dist/content.js` 可被 MV3 `content_scripts` 正常加载 |
 | 回收站生命周期 | 完成 | Trash / Restore / Permanent Delete / Retention 清理 |
 | 导入导出 | 完成 | Manager 端 JSON 导入导出 |
 | 分类规则工作台 | 完成 | Canonical + aliases 管理 |
@@ -203,6 +205,7 @@ npm run build
 2. 触发 `Cmd/Ctrl + Shift + S`
 3. 点击扩展图标进入 Manager
 4. 检查条目是否出现在 Inbox/Library，并尝试编辑分类/标签
+5. 打开网页 DevTools Console，确认没有 `Cannot use import statement outside a module` 报错
 
 <a id="configuration"></a>
 
@@ -292,6 +295,24 @@ npm run check
 3. 打包 `dist/` 为 zip，放入 `releases/`
 4. 按 `docs/store/chrome-web-store-submission.md` 完成上架材料
 
+### 发布前强校验清单（建议每次都跑）
+
+```bash
+# 1) 类型检查
+npm run check
+
+# 2) 严格冗余检查（防止遗留未使用代码）
+npx tsc --noEmit --noUnusedLocals --noUnusedParameters
+
+# 3) 生产构建
+npm run build
+
+# 4) content script 注入安全检查（MV3 content_scripts 不能是模块脚本）
+head -n 1 dist/content.js
+```
+
+若 `dist/content.js` 首行以 `import ...` 开头，或页面出现 `Cannot use import statement outside a module`，请停止提审并先修复打包产物。
+
 <a id="data-and-privacy"></a>
 
 ## 数据与隐私说明
@@ -372,6 +393,15 @@ npm run check
 - `authBridgeUrl` 与实际部署域名
 - Supabase Auth redirect allowlist
 - `public/manifest.json` 的 `externally_connectable.matches`
+
+### Q5: 网页控制台出现 `Cannot use import statement outside a module` 怎么办？
+
+这是 `content script` 被打成模块脚本的典型症状。请按顺序排查：
+
+1. 重新执行 `npm run build`
+2. 检查 `dist/content.js` 首行不应以 `import` 开头
+3. 在 `chrome://extensions/` 点击“重新加载”扩展
+4. 关闭目标页面并重新打开，确保注入的是新产物
 
 <a id="contributing"></a>
 

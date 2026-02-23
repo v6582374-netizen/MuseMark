@@ -1,5 +1,6 @@
 import { render } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { buildFaviconCandidates, nextCandidateOrFallback } from "../shared/favicon";
 import { sendRuntimeMessage } from "../shared/runtime";
 import type { AuthState, BookmarkItem, BookmarkStatus, CategoryRule, SearchTrace, SemanticSearchItem } from "../shared/types";
 import "./styles.css";
@@ -752,30 +753,38 @@ function App() {
           ))}
         </div>
 
-        <div class="search-row">
-          <div class="search-shell">
-            <input
-              value={query}
-              onInput={(event) => setQuery((event.currentTarget as HTMLInputElement).value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  void handleSearchSubmit();
-                }
-              }}
-              placeholder="Ask naturally: the AI agents benchmark article I saw last week"
-            />
+        <section class="search-focus">
+          <div class="search-head">
+            <strong>Semantic Search</strong>
+            <span>Ask naturally and surface what matters first.</span>
           </div>
-          <button class="btn" onClick={() => void handleSearchSubmit()}>
-            Search
-          </button>
-          <button class="btn" onClick={() => void handleSearchBack()} disabled={!canReturnFromSearch}>
-            Back
-          </button>
-          <button class="btn" onClick={() => setPaletteOpen(true)}>
-            Cmd/Ctrl+K
-          </button>
-        </div>
+          <div class="search-main">
+            <div class="search-shell">
+              <input
+                value={query}
+                onInput={(event) => setQuery((event.currentTarget as HTMLInputElement).value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void handleSearchSubmit();
+                  }
+                }}
+                placeholder="Ask naturally: the AI agents benchmark article I saw last week"
+              />
+            </div>
+            <button class="btn primary search-submit-btn" onClick={() => void handleSearchSubmit()}>
+              Search
+            </button>
+          </div>
+          <div class="search-actions">
+            <button class="btn" onClick={() => void handleSearchBack()} disabled={!canReturnFromSearch}>
+              Back
+            </button>
+            <button class="btn" onClick={() => setPaletteOpen(true)}>
+              Cmd/Ctrl+K
+            </button>
+          </div>
+        </section>
 
         <button class="btn primary dock-control-jump-btn" onClick={openOptionsPage}>
           Open Dock Control
@@ -1182,14 +1191,16 @@ function FaviconBadge(props: {
   const { item } = props;
   const candidates = useMemo(() => buildFaviconCandidates(item), [item.favIconUrl, item.url, item.domain]);
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [useLetterFallback, setUseLetterFallback] = useState(false);
   const currentSrc = candidates[currentIndex];
 
   useEffect(() => {
     setCurrentIndex(0);
+    setUseLetterFallback(false);
   }, [candidates.join("|")]);
 
   const fallback = (item.domain || item.title || "?").trim().charAt(0).toUpperCase() || "?";
-  if (currentSrc) {
+  if (currentSrc && !useLetterFallback) {
     return (
       <img
         class="favicon-badge"
@@ -1199,9 +1210,11 @@ function FaviconBadge(props: {
         referrerpolicy="no-referrer"
         onError={() => {
           setCurrentIndex((index) => {
-            if (index + 1 < candidates.length) {
-              return index + 1;
+            const next = nextCandidateOrFallback(candidates, index);
+            if (next.nextSrc) {
+              return next.nextIndex;
             }
+            setUseLetterFallback(true);
             return index;
           });
         }}
@@ -1209,38 +1222,6 @@ function FaviconBadge(props: {
     );
   }
   return <span class="favicon-badge fallback">{fallback}</span>;
-}
-
-function buildFaviconCandidates(item: { favIconUrl?: string; url: string; domain: string }): string[] {
-  const list: string[] = [];
-
-  if (item.favIconUrl) {
-    list.push(item.favIconUrl);
-  }
-
-  try {
-    const parsed = new URL(item.url);
-    list.push(new URL("/favicon.ico", parsed.origin).toString());
-    list.push(`https://www.google.com/s2/favicons?sz=64&domain_url=${encodeURIComponent(parsed.origin)}`);
-    list.push(`https://icons.duckduckgo.com/ip3/${parsed.hostname}.ico`);
-  } catch {
-    const safeDomain = (item.domain ?? "").trim();
-    if (safeDomain) {
-      list.push(`https://www.google.com/s2/favicons?sz=64&domain=${encodeURIComponent(safeDomain)}`);
-      list.push(`https://icons.duckduckgo.com/ip3/${safeDomain}.ico`);
-    }
-  }
-
-  const unique = new Set<string>();
-  for (const candidate of list) {
-    const value = (candidate ?? "").trim();
-    if (!value) {
-      continue;
-    }
-    unique.add(value);
-  }
-
-  return Array.from(unique);
 }
 
 function BookmarkCard(props: {

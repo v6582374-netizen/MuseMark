@@ -211,8 +211,14 @@ type QuickDockUpdateLayoutPayload = {
   activeProfileId?: string;
 };
 
+type QuickDockReorderPinnedPayload = {
+  orderedIds: string[];
+  profileId?: string;
+};
+
 type QuickDockState = {
   enabled: boolean;
+  position: ExtensionSettings["quickDockPosition"];
   layout: DockLayoutState;
   profiles: DockProfile[];
   pinnedIds: string[];
@@ -375,6 +381,12 @@ const embeddingInFlight = new Set<string>();
 const clarifySessions = new Map<string, ClarifySession>();
 let authStorageCache: AuthStorageState | undefined;
 
+function runBackgroundTask(taskName: string, task: () => Promise<unknown>): void {
+  void task().catch((error) => {
+    console.error(`[MuseMark] Background task failed: ${taskName}`, error);
+  });
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   const settings = await getSettingsFromStorage();
   await chrome.storage.local.set({
@@ -384,52 +396,54 @@ chrome.runtime.onInstalled.addListener(async () => {
   await getAuthStorageState();
   await ensureSyncMetaRow();
   await purgeDemoBookmarksOnce();
-  void runTypeReclassifyJobIfNeeded("install");
+  runBackgroundTask("runTypeReclassifyJobIfNeeded(install)", () => runTypeReclassifyJobIfNeeded("install"));
   await ensureBackgroundAlarms();
   await runMigrationSelfCheckIfNeeded(true);
-  void syncNow("install");
+  runBackgroundTask("syncNow(install)", () => syncNow("install"));
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void purgeDemoBookmarksOnce();
-  void runTypeReclassifyJobIfNeeded("startup");
-  void ensureBackgroundAlarms();
-  void runMigrationSelfCheckIfNeeded(false);
-  void syncNow("startup");
+  runBackgroundTask("purgeDemoBookmarksOnce(startup)", () => purgeDemoBookmarksOnce());
+  runBackgroundTask("runTypeReclassifyJobIfNeeded(startup)", () => runTypeReclassifyJobIfNeeded("startup"));
+  runBackgroundTask("ensureBackgroundAlarms(startup)", () => ensureBackgroundAlarms());
+  runBackgroundTask("runMigrationSelfCheckIfNeeded(startup)", () => runMigrationSelfCheckIfNeeded(false));
+  runBackgroundTask("syncNow(startup)", () => syncNow("startup"));
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_BACKFILL) {
-    void runBackfillJob({
-      source: "alarm",
-      limit: BACKFILL_BATCH_SIZE,
-      delayMs: BACKFILL_BATCH_DELAY_MS
-    });
+    runBackgroundTask("runBackfillJob(alarm)", () =>
+      runBackfillJob({
+        source: "alarm",
+        limit: BACKFILL_BATCH_SIZE,
+        delayMs: BACKFILL_BATCH_DELAY_MS
+      })
+    );
   }
 
   if (alarm.name === ALARM_TRASH_CLEANUP) {
-    void runRetentionCleanupJob();
+    runBackgroundTask("runRetentionCleanupJob(alarm)", () => runRetentionCleanupJob());
   }
 
   if (alarm.name === ALARM_SYNC) {
-    void syncNow("alarm");
+    runBackgroundTask("syncNow(alarm)", () => syncNow("alarm"));
   }
 });
 
-void ensureBackgroundAlarms();
-void purgeDemoBookmarksOnce();
-void runTypeReclassifyJobIfNeeded("startup");
-void runMigrationSelfCheckIfNeeded(false);
-void getAuthStorageState();
+runBackgroundTask("ensureBackgroundAlarms(bootstrap)", () => ensureBackgroundAlarms());
+runBackgroundTask("purgeDemoBookmarksOnce(bootstrap)", () => purgeDemoBookmarksOnce());
+runBackgroundTask("runTypeReclassifyJobIfNeeded(bootstrap)", () => runTypeReclassifyJobIfNeeded("startup"));
+runBackgroundTask("runMigrationSelfCheckIfNeeded(bootstrap)", () => runMigrationSelfCheckIfNeeded(false));
+runBackgroundTask("getAuthStorageState(bootstrap)", () => getAuthStorageState());
 
 chrome.commands.onCommand.addListener((command) => {
   if (command === "save-and-classify") {
-    void handleSaveAndClassifyCommand();
+    runBackgroundTask("handleSaveAndClassifyCommand(command)", () => handleSaveAndClassifyCommand());
   }
 });
 
 chrome.action.onClicked.addListener(() => {
-  void openManagerTab();
+  runBackgroundTask("openManagerTab(action)", () => openManagerTab());
 });
 
 chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
@@ -605,6 +619,9 @@ async function routeRuntimeMessage(message: MessageEnvelope, sender: chrome.runt
     case "quickDock/unpin":
       return await unpinQuickDockItem((message.payload ?? {}) as QuickDockPinPayload);
 
+    case "quickDock/reorderPinned":
+      return await reorderQuickDockPinned((message.payload ?? {}) as QuickDockReorderPinnedPayload);
+
     case "quickDock/dismiss":
       return await dismissQuickDockItem((message.payload ?? {}) as QuickDockDismissPayload);
 
@@ -625,7 +642,7 @@ async function routeRuntimeMessage(message: MessageEnvelope, sender: chrome.runt
       await requestNetworkPermissionsForSettings(current, merged);
       const saved = await saveSettingsToStorage(merged);
       if (saved.classificationMode === "by_type") {
-        void runTypeReclassifyJobIfNeeded("settings");
+        runBackgroundTask("runTypeReclassifyJobIfNeeded(settings)", () => runTypeReclassifyJobIfNeeded("settings"));
       }
       return saved;
     }
@@ -1559,6 +1576,7 @@ async function getQuickDockState(payload: QuickDockGetStatePayload): Promise<Qui
 
   return {
     enabled: settings.quickDockEnabled,
+    position: settings.quickDockPosition,
     layout: storage.layout,
     profiles: storage.profiles,
     pinnedIds: getPinnedIdsForProfile(storage, profile.id),
@@ -1742,6 +1760,77 @@ async function unpinQuickDockItem(payload: QuickDockPinPayload): Promise<{ pinne
   return {
     pinned: false,
     pinnedIds: getPinnedIdsForProfile(storage, storage.layout.activeProfileId)
+  };
+}
+
+async function reorderQuickDockPinned(
+  payload: QuickDockReorderPinnedPayload
+): Promise<{ pinned: true; profileId: string; pinnedIds: string[] }> {
+  const settings = await getSettingsFromStorage();
+  const storage = await ensureQuickDockStorage(settings);
+  const profileId =
+    payload.profileId && storage.profiles.some((entry) => entry.id === payload.profileId)
+      ? payload.profileId
+      : storage.layout.activeProfileId;
+  const profile = storage.profiles.find((entry) => entry.id === profileId) ?? storage.profiles[0];
+  if (!profile) {
+    return {
+      pinned: true,
+      profileId,
+      pinnedIds: []
+    };
+  }
+
+  const currentPinnedIds = getPinnedIdsForProfile(storage, profile.id);
+  const pinnedSet = new Set(currentPinnedIds);
+  const seen = new Set<string>();
+  const requestedIds = Array.isArray(payload.orderedIds) ? payload.orderedIds : [];
+
+  const normalizedPinnedIds: string[] = [];
+  for (const candidate of requestedIds) {
+    const bookmarkId = typeof candidate === "string" ? candidate.trim() : "";
+    if (!bookmarkId || seen.has(bookmarkId) || !pinnedSet.has(bookmarkId)) {
+      continue;
+    }
+    seen.add(bookmarkId);
+    normalizedPinnedIds.push(bookmarkId);
+  }
+  for (const bookmarkId of currentPinnedIds) {
+    if (seen.has(bookmarkId)) {
+      continue;
+    }
+    seen.add(bookmarkId);
+    normalizedPinnedIds.push(bookmarkId);
+  }
+
+  const profileTail = profile.itemIds.filter((bookmarkId) => !pinnedSet.has(bookmarkId));
+  profile.itemIds = [...normalizedPinnedIds, ...profileTail];
+  profile.updatedAt = nowIso();
+
+  const orderMap = new Map<string, number>(normalizedPinnedIds.map((bookmarkId, index) => [bookmarkId, index + 1]));
+  for (const [bookmarkId, pref] of storage.prefsById.entries()) {
+    if (!pref.pinned) {
+      continue;
+    }
+    const nextOrder = orderMap.get(bookmarkId);
+    if (!nextOrder) {
+      continue;
+    }
+    storage.prefsById.set(bookmarkId, {
+      ...pref,
+      pinOrder: nextOrder
+    });
+  }
+
+  await chrome.storage.local.set({
+    [STORAGE_QUICKDOCK_PROFILES_KEY]: storage.profiles,
+    [STORAGE_QUICKDOCK_PREFS_KEY]: serializeDockPreferences(storage.prefsById)
+  });
+
+  return {
+    pinned: true,
+    profileId: profile.id,
+    pinnedIds: getPinnedIdsForProfile(storage, profile.id)
   };
 }
 
@@ -2554,616 +2643,6 @@ async function importBookmarks(payload: { items: BookmarkItem[]; categoryRules?:
     await db.bookmarks.put(merged);
     queueEmbeddingRefresh(merged.id);
   }
-}
-
-async function seedDemoData(payload?: { count?: number; overwrite?: boolean }): Promise<{
-  created: number;
-  updated: number;
-  requested: number;
-}> {
-  const requested = Number.isFinite(payload?.count) ? Math.max(1, Math.min(200, Number(payload?.count))) : 50;
-  const overwrite = Boolean(payload?.overwrite);
-  const now = Date.now();
-
-  const canonicalCategories = [
-    "AI Agents",
-    "Product",
-    "Design",
-    "Engineering",
-    "Research",
-    "Growth",
-    "Business",
-    "Tools"
-  ];
-  const categoryAliases: Record<string, string[]> = {
-    "AI Agents": ["AI Tools", "LLM", "Agent"],
-    Product: ["PM", "Roadmap"],
-    Design: ["UX", "UI", "Interaction"],
-    Engineering: ["Dev", "Coding", "Architecture"],
-    Research: ["Paper", "Benchmark"],
-    Growth: ["Marketing", "SEO"],
-    Business: ["Finance", "Market"],
-    Tools: ["SaaS", "Apps"]
-  };
-  const pinnedCategories = new Set<string>(["AI Agents", "Engineering", "Product"]);
-
-  for (const category of canonicalCategories) {
-    await upsertCategoryRule({
-      canonical: category,
-      aliases: categoryAliases[category] ?? [],
-      pinned: pinnedCategories.has(category)
-    });
-  }
-
-  type DemoSeedEntry = {
-    url: string;
-    title: string;
-    category: string;
-    tags: string[];
-    summary: string;
-    note: string;
-  };
-
-  const demoEntries: DemoSeedEntry[] = [
-    {
-      url: "https://platform.openai.com/docs/overview",
-      title: "OpenAI Docs Overview",
-      category: "AI Agents",
-      tags: ["AI", "API", "OpenAI"],
-      summary: "官方 API 概览，适合作为模型调用与能力边界的总入口。",
-      note: "先从总览建立统一心智模型。"
-    },
-    {
-      url: "https://platform.openai.com/docs/models",
-      title: "OpenAI Models",
-      category: "AI Agents",
-      tags: ["模型", "选型", "OpenAI"],
-      summary: "模型能力与成本对比页面，适合做生产模型选型。",
-      note: "收藏用于按场景挑模型。"
-    },
-    {
-      url: "https://platform.openai.com/docs/guides/text",
-      title: "Text Generation Guide",
-      category: "AI Agents",
-      tags: ["Prompt", "文本", "生成"],
-      summary: "文本生成的最佳实践与参数建议。",
-      note: "用于优化文案生成链路。"
-    },
-    {
-      url: "https://platform.openai.com/docs/guides/function-calling",
-      title: "Function Calling Guide",
-      category: "AI Agents",
-      tags: ["Function Calling", "Tool Use", "Agent"],
-      summary: "结构化工具调用的核心指南。",
-      note: "构建工具型 Agent 的关键文档。"
-    },
-    {
-      url: "https://platform.openai.com/docs/guides/structured-outputs",
-      title: "Structured Outputs Guide",
-      category: "AI Agents",
-      tags: ["JSON", "结构化输出", "稳定性"],
-      summary: "让模型稳定返回结构化结果的实践指南。",
-      note: "用于降低解析失败率。"
-    },
-    {
-      url: "https://platform.openai.com/docs/guides/embeddings",
-      title: "Embeddings Guide",
-      category: "AI Agents",
-      tags: ["向量", "检索", "Embedding"],
-      summary: "embedding 生成与相似检索策略。",
-      note: "语义搜索能力的基础文档。"
-    },
-    {
-      url: "https://platform.openai.com/docs/api-reference/chat",
-      title: "Chat Completions API Reference",
-      category: "Engineering",
-      tags: ["API", "Chat", "Reference"],
-      summary: "chat 接口字段与响应结构的详细参考。",
-      note: "排查请求参数时常用。"
-    },
-    {
-      url: "https://platform.openai.com/docs/api-reference/embeddings",
-      title: "Embeddings API Reference",
-      category: "Engineering",
-      tags: ["Embedding", "API", "Reference"],
-      summary: "embedding 接口的完整参数说明。",
-      note: "用于接入向量召回接口。"
-    },
-    {
-      url: "https://github.com/openai/openai-cookbook",
-      title: "OpenAI Cookbook",
-      category: "Tools",
-      tags: ["示例", "Open Source", "实践"],
-      summary: "官方示例仓库，覆盖多场景落地方案。",
-      note: "遇到场景问题先看 cookbook。"
-    },
-    {
-      url: "https://github.com/openai/evals",
-      title: "OpenAI Evals",
-      category: "Research",
-      tags: ["评测", "Evals", "质量"],
-      summary: "评测框架与思路，适合构建模型质量基线。",
-      note: "用于建立分类准确性评测。"
-    },
-    {
-      url: "https://python.langchain.com/docs/introduction/",
-      title: "LangChain Introduction",
-      category: "AI Agents",
-      tags: ["LangChain", "Agent", "Framework"],
-      summary: "LangChain 框架的核心概念与能力图谱。",
-      note: "快速理解 agent 框架。"
-    },
-    {
-      url: "https://python.langchain.com/docs/tutorials/",
-      title: "LangChain Tutorials",
-      category: "AI Agents",
-      tags: ["教程", "LangChain", "实战"],
-      summary: "分步骤教程合集，适合快速上手。",
-      note: "用于搭建第一个可运行 demo。"
-    },
-    {
-      url: "https://docs.llamaindex.ai/en/stable/",
-      title: "LlamaIndex Docs",
-      category: "AI Agents",
-      tags: ["RAG", "LlamaIndex", "检索"],
-      summary: "RAG 管线搭建的常用框架文档。",
-      note: "检索增强场景常看。"
-    },
-    {
-      url: "https://microsoft.github.io/autogen/stable/",
-      title: "Microsoft AutoGen Docs",
-      category: "AI Agents",
-      tags: ["AutoGen", "Multi-Agent", "Workflow"],
-      summary: "多智能体协作框架文档。",
-      note: "研究多 agent 编排。"
-    },
-    {
-      url: "https://docs.crewai.com/",
-      title: "CrewAI Documentation",
-      category: "AI Agents",
-      tags: ["CrewAI", "Automation", "Agent"],
-      summary: "面向任务协作的 agent 工程化文档。",
-      note: "用于对比多 agent 框架。"
-    },
-    {
-      url: "https://docs.langgraph.dev/",
-      title: "LangGraph Docs",
-      category: "Engineering",
-      tags: ["LangGraph", "State Machine", "Agent"],
-      summary: "状态机式 agent 编排与持久化实践。",
-      note: "适合复杂流程控制。"
-    },
-    {
-      url: "https://docs.mem0.ai/",
-      title: "Mem0 Docs",
-      category: "Tools",
-      tags: ["Memory", "Agent", "Personalization"],
-      summary: "长期记忆能力的接入方式与策略。",
-      note: "用于个性化检索与记忆。"
-    },
-    {
-      url: "https://docs.pinecone.io/guides/get-started/quickstart",
-      title: "Pinecone Quickstart",
-      category: "Engineering",
-      tags: ["向量数据库", "Pinecone", "Quickstart"],
-      summary: "向量库快速接入流程。",
-      note: "检索性能验证时使用。"
-    },
-    {
-      url: "https://www.pinecone.io/learn/what-is-a-vector-database/",
-      title: "What Is a Vector Database",
-      category: "Research",
-      tags: ["Vector DB", "基础", "检索"],
-      summary: "向量数据库原理与场景解释。",
-      note: "给团队做概念对齐。"
-    },
-    {
-      url: "https://weaviate.io/developers/weaviate",
-      title: "Weaviate Developer Docs",
-      category: "Engineering",
-      tags: ["Weaviate", "向量", "搜索"],
-      summary: "Weaviate API 与 schema 设计入口。",
-      note: "用于对比向量库方案。"
-    },
-    {
-      url: "https://developer.chrome.com/docs/extensions/get-started/tutorial/hello-world",
-      title: "Chrome Extensions Hello World",
-      category: "Engineering",
-      tags: ["Chrome Extension", "MV3", "入门"],
-      summary: "扩展开发官方入门教程。",
-      note: "新同事 onboarding 必看。"
-    },
-    {
-      url: "https://developer.chrome.com/docs/extensions/reference/api/commands",
-      title: "Chrome Commands API",
-      category: "Engineering",
-      tags: ["快捷键", "Commands", "Extension"],
-      summary: "扩展快捷键定义与行为说明。",
-      note: "快捷键冲突排查常用。"
-    },
-    {
-      url: "https://developer.chrome.com/docs/extensions/reference/api/scripting",
-      title: "Chrome Scripting API",
-      category: "Engineering",
-      tags: ["Scripting", "Content Script", "Extension"],
-      summary: "脚本注入与执行模型官方文档。",
-      note: "页面注入问题排查参考。"
-    },
-    {
-      url: "https://developer.chrome.com/docs/extensions/reference/api/storage",
-      title: "Chrome Storage API",
-      category: "Engineering",
-      tags: ["Storage", "Extension", "Config"],
-      summary: "扩展本地存储能力与限制。",
-      note: "设置项持久化的标准方案。"
-    },
-    {
-      url: "https://developer.chrome.com/docs/extensions/develop/concepts/service-workers/lifecycle",
-      title: "MV3 Service Worker Lifecycle",
-      category: "Engineering",
-      tags: ["Service Worker", "Lifecycle", "MV3"],
-      summary: "MV3 生命周期机制及常见坑点。",
-      note: "后台任务稳定性必看。"
-    },
-    {
-      url: "https://dexie.org/docs/Tutorial/Getting-started",
-      title: "Dexie Getting Started",
-      category: "Engineering",
-      tags: ["Dexie", "IndexedDB", "数据层"],
-      summary: "Dexie 快速上手与索引设计。",
-      note: "本地数据库开发参考。"
-    },
-    {
-      url: "https://vite.dev/guide/",
-      title: "Vite Guide",
-      category: "Engineering",
-      tags: ["Vite", "Build", "Frontend"],
-      summary: "Vite 构建与开发体验指南。",
-      note: "扩展工程构建体系参考。"
-    },
-    {
-      url: "https://www.typescriptlang.org/docs/handbook/intro.html",
-      title: "TypeScript Handbook Intro",
-      category: "Engineering",
-      tags: ["TypeScript", "类型系统", "Handbook"],
-      summary: "TS 官方手册入口。",
-      note: "类型设计与约束参考。"
-    },
-    {
-      url: "https://preactjs.com/guide/v10/getting-started",
-      title: "Preact Getting Started",
-      category: "Engineering",
-      tags: ["Preact", "UI", "轻量框架"],
-      summary: "Preact 组件与状态管理入门。",
-      note: "管理页性能优化参考。"
-    },
-    {
-      url: "https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API",
-      title: "MDN IndexedDB API",
-      category: "Engineering",
-      tags: ["IndexedDB", "MDN", "浏览器存储"],
-      summary: "IndexedDB 原生 API 规范说明。",
-      note: "深入排障时查底层行为。"
-    },
-    {
-      url: "https://www.figma.com/developers/api",
-      title: "Figma API Docs",
-      category: "Design",
-      tags: ["Figma", "Design API", "Automation"],
-      summary: "Figma 开发者接口总览。",
-      note: "设计数据集成参考。"
-    },
-    {
-      url: "https://www.figma.com/resource-library/design-systems/",
-      title: "Figma Design Systems",
-      category: "Design",
-      tags: ["Design System", "UI", "Figma"],
-      summary: "设计系统实践与案例。",
-      note: "UI 体系建设参考。"
-    },
-    {
-      url: "https://linear.app/docs",
-      title: "Linear Documentation",
-      category: "Product",
-      tags: ["Linear", "Productivity", "Workflow"],
-      summary: "Linear 使用与流程设计文档。",
-      note: "任务管理体验参考。"
-    },
-    {
-      url: "https://developers.notion.com/docs/getting-started",
-      title: "Notion API Getting Started",
-      category: "Product",
-      tags: ["Notion", "API", "Integration"],
-      summary: "Notion API 接入指南。",
-      note: "知识库双向同步可参考。"
-    },
-    {
-      url: "https://www.nngroup.com/articles/ten-usability-heuristics/",
-      title: "NN/g Usability Heuristics",
-      category: "Design",
-      tags: ["UX", "可用性", "原则"],
-      summary: "经典可用性启发式原则。",
-      note: "交互评审时快速对照。"
-    },
-    {
-      url: "https://www.smashingmagazine.com/category/user-experience/",
-      title: "Smashing Magazine UX",
-      category: "Design",
-      tags: ["UX", "案例", "设计"],
-      summary: "前沿 UX 文章合集。",
-      note: "获取行业设计趋势。"
-    },
-    {
-      url: "https://m3.material.io/",
-      title: "Material Design 3",
-      category: "Design",
-      tags: ["Material", "Design System", "Component"],
-      summary: "Material 3 设计规范与组件体系。",
-      note: "组件细节与动效参考。"
-    },
-    {
-      url: "https://atlassian.design/",
-      title: "Atlassian Design System",
-      category: "Design",
-      tags: ["Design System", "Token", "Enterprise"],
-      summary: "企业级设计系统公开资料。",
-      note: "大规模系统化设计参考。"
-    },
-    {
-      url: "https://www.notion.so/help/guides/ai-meeting-notes-summaries",
-      title: "Notion AI Meeting Notes Guide",
-      category: "Product",
-      tags: ["Notion AI", "会议", "效率"],
-      summary: "AI 会议纪要与总结流程实践。",
-      note: "会议信息整理流程可借鉴。"
-    },
-    {
-      url: "https://www.intercom.com/blog/product-management/",
-      title: "Intercom Product Management",
-      category: "Product",
-      tags: ["Product", "Management", "SaaS"],
-      summary: "产品管理实践文章集合。",
-      note: "产品决策与方法论输入。"
-    },
-    {
-      url: "https://arxiv.org/abs/1706.03762",
-      title: "Attention Is All You Need",
-      category: "Research",
-      tags: ["Transformer", "论文", "NLP"],
-      summary: "Transformer 论文原文。",
-      note: "大模型基础必读。"
-    },
-    {
-      url: "https://arxiv.org/abs/2210.03629",
-      title: "ReAct: Synergizing Reasoning and Acting",
-      category: "Research",
-      tags: ["ReAct", "Agent", "论文"],
-      summary: "推理与行动结合的经典方法。",
-      note: "Agent 行为设计参考。"
-    },
-    {
-      url: "https://arxiv.org/abs/2302.04761",
-      title: "Toolformer",
-      category: "Research",
-      tags: ["Toolformer", "工具调用", "论文"],
-      summary: "模型学习工具调用的代表工作。",
-      note: "函数调用策略对照。"
-    },
-    {
-      url: "https://arxiv.org/abs/2305.15334",
-      title: "Gorilla: LLM for API Calls",
-      category: "Research",
-      tags: ["API", "LLM", "论文"],
-      summary: "面向 API 调用场景的模型研究。",
-      note: "API 代理能力研究参考。"
-    },
-    {
-      url: "https://arxiv.org/abs/2005.11401",
-      title: "Retrieval-Augmented Generation for NLP Tasks",
-      category: "Research",
-      tags: ["RAG", "检索", "论文"],
-      summary: "RAG 经典论文原文。",
-      note: "语义检索系统理论基础。"
-    },
-    {
-      url: "https://arxiv.org/abs/2106.09685",
-      title: "LoRA: Low-Rank Adaptation",
-      category: "Research",
-      tags: ["LoRA", "微调", "论文"],
-      summary: "参数高效微调方法代表论文。",
-      note: "模型定制策略参考。"
-    },
-    {
-      url: "https://a16z.com/ai-canon/",
-      title: "a16z AI Canon",
-      category: "Business",
-      tags: ["AI", "商业", "趋势"],
-      summary: "AI 产业与公司分析合集。",
-      note: "看宏观方向时使用。"
-    },
-    {
-      url: "https://www.sequoiacap.com/article/generative-ai-a-creative-new-world/",
-      title: "Sequoia: Generative AI",
-      category: "Business",
-      tags: ["GenAI", "投资", "市场"],
-      summary: "生成式 AI 商业格局观察。",
-      note: "商业模型讨论参考。"
-    },
-    {
-      url: "https://stripe.com/resources/more",
-      title: "Stripe Resource Center",
-      category: "Growth",
-      tags: ["SaaS", "Growth", "Business"],
-      summary: "支付与业务增长资源中心。",
-      note: "增长与运营案例输入。"
-    },
-    {
-      url: "https://www.ycombinator.com/library",
-      title: "Y Combinator Library",
-      category: "Growth",
-      tags: ["创业", "增长", "产品"],
-      summary: "创业与增长主题的优质内容库。",
-      note: "产品增长策略参考。"
-    },
-    {
-      url: "https://news.ycombinator.com/",
-      title: "Hacker News",
-      category: "Tools",
-      tags: ["资讯", "技术", "社区"],
-      summary: "高质量技术与产品新闻社区。",
-      note: "每天抓新趋势的入口。"
-    }
-  ];
-  const statusPool: BookmarkStatus[] = [
-    "classified",
-    "classified",
-    "inbox",
-    "classified",
-    "analyzing",
-    "error",
-    "classified",
-    "inbox",
-    "trashed",
-    "classified"
-  ];
-  const tagPool = [
-    "AI",
-    "效率",
-    "工具",
-    "产品",
-    "设计",
-    "工程",
-    "商业",
-    "增长",
-    "自动化",
-    "阅读"
-  ];
-
-  let allExisting = await db.bookmarks.toArray();
-  const legacyDemoIds = allExisting
-    .filter((item) => (item.canonicalUrl || item.url || "").includes("demo.musemark.local"))
-    .map((item) => item.id);
-  if (legacyDemoIds.length > 0) {
-    await db.bookmarks.bulkDelete(legacyDemoIds);
-    allExisting = allExisting.filter((item) => !legacyDemoIds.includes(item.id));
-  }
-
-  const existingByUrl = new Map<string, BookmarkItem>();
-  for (const item of allExisting) {
-    const key = normalizeUrl(item.canonicalUrl || item.url);
-    if (key) {
-      existingByUrl.set(key, item);
-    }
-  }
-
-  let created = 0;
-  let updated = 0;
-
-  for (let index = 0; index < requested; index += 1) {
-    const number = index + 1;
-    const entry = demoEntries[index % demoEntries.length];
-    const category = canonicalCategories.includes(entry.category) ? entry.category : canonicalCategories[index % canonicalCategories.length];
-    const status = statusPool[index % statusPool.length];
-    const canonicalUrl = normalizeUrl(entry.url);
-    const url = entry.url;
-    let domain = "";
-    try {
-      domain = new URL(url).hostname;
-    } catch {
-      domain = "unknown.domain";
-    }
-
-    const createdAt = new Date(now - (index + 1) * 86_400_000).toISOString();
-    const updatedAt = new Date(now - (index * 2 + 1) * 3_600_000).toISOString();
-    const deletedAt = status === "trashed" ? new Date(now - (32 + index) * 86_400_000).toISOString() : undefined;
-    const uniqueTags = normalizeTags(entry.tags);
-    const summary = `Demo #${number}: ${entry.summary}`;
-    const statusReason =
-      status === "error" ? "Mocked API timeout for test preview." : "Generated demo classification for UI validation.";
-
-    const baseItem: BookmarkItem = {
-      id: crypto.randomUUID(),
-      url,
-      canonicalUrl,
-      title: entry.title,
-      domain,
-      favIconUrl: deriveFaviconFallback(url, domain),
-      createdAt,
-      updatedAt,
-      lastSavedAt: updatedAt,
-      saveCount: 1 + (index % 4),
-      status,
-      pinned: index % 13 === 0,
-      locked: index % 17 === 0 && status !== "trashed",
-      deletedAt,
-      userNote: entry.note,
-      aiSummary: summary,
-      category: status === "classified" || status === "error" ? category : undefined,
-      tags: uniqueTags,
-      classificationConfidence: status === "classified" ? clamp01(0.62 + (index % 7) * 0.05) : undefined,
-      aiMeta: {
-        provider: "openai_compatible",
-        baseUrl: "https://api.openai.com",
-        model: "gpt-4.1-mini",
-        promptVersion: PROMPT_VERSION,
-        stage1: {
-          finishedAt: updatedAt,
-          confidence: 0.78
-        },
-        stage2:
-          status === "classified"
-            ? {
-                finishedAt: updatedAt,
-                confidence: 0.74
-              }
-            : undefined,
-        lastError: status === "error" ? statusReason : undefined
-      },
-      contentCapture: {
-        textDigest: `demo_digest_${number}_${domain}`,
-        textChars: 1800 + index * 17,
-        captureMode: "readability"
-      },
-      syncState: "dirty",
-      searchText: ""
-    };
-
-    baseItem.searchText = buildSearchText(baseItem);
-    const key = normalizeUrl(canonicalUrl);
-    const existing = existingByUrl.get(key);
-
-    if (existing) {
-      if (!overwrite) {
-        continue;
-      }
-
-      const merged: BookmarkItem = {
-        ...existing,
-        ...baseItem,
-        id: existing.id,
-        createdAt: existing.createdAt || baseItem.createdAt,
-        updatedAt: nowIso(),
-        lastSavedAt: nowIso(),
-        syncState: "dirty",
-        saveCount: Math.max(existing.saveCount ?? 1, baseItem.saveCount)
-      };
-      merged.searchText = buildSearchText(merged);
-      await db.bookmarks.put(merged);
-      existingByUrl.set(key, merged);
-      updated += 1;
-      continue;
-    }
-
-    await db.bookmarks.put(baseItem);
-    existingByUrl.set(key, baseItem);
-    created += 1;
-  }
-
-  return {
-    created,
-    updated,
-    requested
-  };
 }
 
 async function backfillFavicons(payload?: { limit?: number }): Promise<{ scanned: number; updated: number }> {
@@ -4470,7 +3949,7 @@ async function signInOAuth(provider: "google"): Promise<{ state: AuthState }> {
       migrationDone: false
     });
 
-    void syncNow("auth");
+    runBackgroundTask("syncNow(auth)", () => syncNow("auth"));
 
     return {
       state: await getAuthState()
@@ -4630,7 +4109,7 @@ async function handleBridgeCompleteMessage(
     migrationDone: false
   });
 
-  void syncNow("bridge");
+  runBackgroundTask("syncNow(bridge)", () => syncNow("bridge"));
 
   return {
     state: await getAuthState()
@@ -5207,6 +4686,7 @@ function buildCloudSettingsPayload(settings: ExtensionSettings): Partial<Extensi
     maxChars: settings.maxChars,
     quickDockEnabled: settings.quickDockEnabled,
     quickDockCollapsedByDefault: settings.quickDockCollapsedByDefault,
+    quickDockPosition: settings.quickDockPosition,
     quickDockMaxItems: settings.quickDockMaxItems,
     quickDockPinMode: settings.quickDockPinMode,
     classificationMode: settings.classificationMode,

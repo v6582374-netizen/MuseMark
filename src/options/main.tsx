@@ -1,5 +1,6 @@
 import { render } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
+import { buildFaviconCandidates, nextCandidateOrFallback } from "../shared/favicon";
 import { DEFAULT_SETTINGS } from "../shared/settings";
 import { sendRuntimeMessage } from "../shared/runtime";
 import type { DockEntry, ExtensionSettings } from "../shared/types";
@@ -13,6 +14,12 @@ type QuickDockControlDataResponse = {
   suggestedEntries: DockEntry[];
 };
 
+type QuickDockReorderResponse = {
+  pinned: true;
+  profileId: string;
+  pinnedIds: string[];
+};
+
 function App() {
   const [settings, setSettings] = useState<ExtensionSettings>(DEFAULT_SETTINGS);
   const [excludedText, setExcludedText] = useState("");
@@ -23,6 +30,8 @@ function App() {
   const [dockEnabled, setDockEnabled] = useState(true);
   const [dockPinnedEntries, setDockPinnedEntries] = useState<DockEntry[]>([]);
   const [dockSuggestedEntries, setDockSuggestedEntries] = useState<DockEntry[]>([]);
+  const [dockDraggingId, setDockDraggingId] = useState<string | null>(null);
+  const [dockDropTargetId, setDockDropTargetId] = useState<string | null>(null);
 
   const weights = useMemo(() => settings.rankingWeights, [settings.rankingWeights]);
 
@@ -173,6 +182,37 @@ function App() {
       });
     } catch (error) {
       setDockControlError(toErrorMessage(error));
+    }
+  }
+
+  async function handlePinnedDrop(targetId: string) {
+    if (!dockDraggingId || dockDraggingId === targetId) {
+      setDockDraggingId(null);
+      setDockDropTargetId(null);
+      return;
+    }
+
+    const nextEntries = moveDockEntryById(dockPinnedEntries, dockDraggingId, targetId);
+    if (nextEntries === dockPinnedEntries) {
+      setDockDraggingId(null);
+      setDockDropTargetId(null);
+      return;
+    }
+
+    setDockPinnedEntries(nextEntries);
+    setDockDraggingId(null);
+    setDockDropTargetId(null);
+
+    try {
+      const response = await sendRuntimeMessage<QuickDockReorderResponse>("quickDock/reorderPinned", {
+        orderedIds: nextEntries.map((entry) => entry.id)
+      });
+      if (Array.isArray(response.pinnedIds) && response.pinnedIds.length > 0) {
+        setDockPinnedEntries((current) => reorderDockEntriesByIds(current, response.pinnedIds));
+      }
+    } catch (error) {
+      setDockControlError(toErrorMessage(error));
+      await reloadDockControlData();
     }
   }
 
@@ -617,6 +657,22 @@ function App() {
               </div>
 
               <div class="field">
+                <label>QuickDock position</label>
+                <select
+                  value={settings.quickDockPosition}
+                  onChange={(event) =>
+                    setSettings({
+                      ...settings,
+                      quickDockPosition: (event.currentTarget as HTMLSelectElement).value as "right" | "bottom_center"
+                    })
+                  }
+                >
+                  <option value="right">Right side</option>
+                  <option value="bottom_center">Bottom center</option>
+                </select>
+              </div>
+
+              <div class="field">
                 <label>QuickDock max items</label>
                 <select
                   value={String(settings.quickDockMaxItems)}
@@ -737,29 +793,67 @@ function App() {
               <div class="dock-empty">No pinned bookmarks.</div>
             ) : (
               <div class="dock-list">
-                {dockPinnedEntries.map((entry) => (
-                  <div class="dock-row" key={`pinned-${entry.id}`}>
-                    <div class="dock-row-main">
-                      {entry.favIconUrl ? (
-                        <img class="dock-favicon" src={entry.favIconUrl} alt={entry.domain || entry.title} />
-                      ) : (
-                        <span class="dock-favicon dock-fallback">{(entry.domain || entry.title || "?").slice(0, 1).toUpperCase()}</span>
-                      )}
-                      <div class="dock-row-copy">
-                        <strong>{entry.title || entry.url || entry.id}</strong>
-                        <small>{entry.domain || entry.url || "No URL"}</small>
+                {dockPinnedEntries.map((entry) => {
+                  const rowClass = [
+                    "dock-row",
+                    "is-draggable",
+                    dockDraggingId === entry.id ? "is-dragging" : "",
+                    dockDropTargetId === entry.id && dockDraggingId !== entry.id ? "is-drop-target" : ""
+                  ]
+                    .filter(Boolean)
+                    .join(" ");
+                  return (
+                    <div
+                      class={rowClass}
+                      key={`pinned-${entry.id}`}
+                      draggable
+                      onDragStart={(event) => {
+                        setDockDraggingId(entry.id);
+                        setDockDropTargetId(entry.id);
+                        if (event.dataTransfer) {
+                          event.dataTransfer.effectAllowed = "move";
+                          event.dataTransfer.setData("text/plain", entry.id);
+                        }
+                      }}
+                      onDragOver={(event) => {
+                        if (!dockDraggingId || dockDraggingId === entry.id) {
+                          return;
+                        }
+                        event.preventDefault();
+                        if (event.dataTransfer) {
+                          event.dataTransfer.dropEffect = "move";
+                        }
+                        if (dockDropTargetId !== entry.id) {
+                          setDockDropTargetId(entry.id);
+                        }
+                      }}
+                      onDrop={(event) => {
+                        event.preventDefault();
+                        void handlePinnedDrop(entry.id);
+                      }}
+                      onDragEnd={() => {
+                        setDockDraggingId(null);
+                        setDockDropTargetId(null);
+                      }}
+                    >
+                      <div class="dock-row-main">
+                        <DockFavicon entry={entry} />
+                        <div class="dock-row-copy">
+                          <strong>{entry.title || entry.url || entry.id}</strong>
+                          <small>{entry.domain || entry.url || "No URL"}</small>
+                        </div>
+                      </div>
+                      <div class="dock-row-actions">
+                        <button class="btn" type="button" onClick={() => void handleOpenDockEntry(entry)} disabled={!entry.url}>
+                          Open
+                        </button>
+                        <button class="btn" type="button" onClick={() => void handleUnpinFromDock(entry)}>
+                          Unpin
+                        </button>
                       </div>
                     </div>
-                    <div class="dock-row-actions">
-                      <button class="btn" type="button" onClick={() => void handleOpenDockEntry(entry)} disabled={!entry.url}>
-                        Open
-                      </button>
-                      <button class="btn" type="button" onClick={() => void handleUnpinFromDock(entry)}>
-                        Unpin
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -780,11 +874,7 @@ function App() {
                 {dockSuggestedEntries.map((entry) => (
                   <div class="dock-row" key={`suggested-${entry.id}`}>
                     <div class="dock-row-main">
-                      {entry.favIconUrl ? (
-                        <img class="dock-favicon" src={entry.favIconUrl} alt={entry.domain || entry.title} />
-                      ) : (
-                        <span class="dock-favicon dock-fallback">{(entry.domain || entry.title || "?").slice(0, 1).toUpperCase()}</span>
-                      )}
+                      <DockFavicon entry={entry} />
                       <div class="dock-row-copy">
                         <strong>{entry.title || entry.url || entry.id}</strong>
                         <small>{entry.domain || entry.url || "No URL"}</small>
@@ -810,6 +900,91 @@ function App() {
       </main>
     </div>
   );
+}
+
+function DockFavicon(props: { entry: DockEntry }) {
+  const { entry } = props;
+  const candidates = useMemo(
+    () =>
+      buildFaviconCandidates({
+        favIconUrl: entry.favIconUrl,
+        url: entry.url,
+        domain: entry.domain
+      }),
+    [entry.favIconUrl, entry.url, entry.domain]
+  );
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [useLetterFallback, setUseLetterFallback] = useState(false);
+  const currentSrc = candidates[currentIndex];
+
+  useEffect(() => {
+    setCurrentIndex(0);
+    setUseLetterFallback(false);
+  }, [candidates.join("|")]);
+
+  if (currentSrc && !useLetterFallback) {
+    return (
+      <img
+        class="dock-favicon"
+        src={currentSrc}
+        alt={entry.domain || entry.title}
+        loading="lazy"
+        referrerpolicy="no-referrer"
+        onError={() => {
+          setCurrentIndex((index) => {
+            const next = nextCandidateOrFallback(candidates, index);
+            if (next.nextSrc) {
+              return next.nextIndex;
+            }
+            setUseLetterFallback(true);
+            return index;
+          });
+        }}
+      />
+    );
+  }
+
+  return <span class="dock-favicon dock-fallback">{(entry.domain || entry.title || "?").slice(0, 1).toUpperCase()}</span>;
+}
+
+function moveDockEntryById(entries: DockEntry[], fromId: string, toId: string): DockEntry[] {
+  const fromIndex = entries.findIndex((entry) => entry.id === fromId);
+  const toIndex = entries.findIndex((entry) => entry.id === toId);
+  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) {
+    return entries;
+  }
+  const next = [...entries];
+  const [moving] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, moving);
+  return next;
+}
+
+function reorderDockEntriesByIds(entries: DockEntry[], orderedIds: string[]): DockEntry[] {
+  const seen = new Set<string>();
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const ordered: DockEntry[] = [];
+
+  for (const bookmarkId of orderedIds) {
+    if (seen.has(bookmarkId)) {
+      continue;
+    }
+    const item = byId.get(bookmarkId);
+    if (!item) {
+      continue;
+    }
+    seen.add(bookmarkId);
+    ordered.push(item);
+  }
+
+  for (const entry of entries) {
+    if (seen.has(entry.id)) {
+      continue;
+    }
+    seen.add(entry.id);
+    ordered.push(entry);
+  }
+
+  return ordered;
 }
 
 function toErrorMessage(error: unknown): string {

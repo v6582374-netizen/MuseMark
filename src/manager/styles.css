@@ -239,7 +239,6 @@ a {
 }
 
 .scope-switch,
-.search-row,
 .toolbar,
 .metric-row,
 .chip-row {
@@ -270,15 +269,67 @@ a {
   letter-spacing: 0.01em;
 }
 
-.search-row {
+.search-focus {
+  border-radius: var(--radius-md);
+  padding: 12px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 10px;
+  background:
+    linear-gradient(142deg, hsla(191 100% 48% / 0.18), hsla(224 24% 14% / 0.88) 56%),
+    var(--surface-glass-strong);
+  box-shadow:
+    var(--shadow-z1),
+    inset 0 0 0 0.5px hsla(191 100% 78% / 0.36),
+    inset 0 1px 0 hsla(194 100% 95% / 0.22);
+}
+
+.search-head {
+  display: grid;
+  gap: 4px;
+}
+
+.search-head strong {
+  color: var(--text-strong);
+  font-size: var(--step-1);
+  font-weight: var(--fw-title);
+  letter-spacing: 0.02em;
+}
+
+.search-head span {
+  color: hsl(200 20% 76%);
+  font-size: var(--step--1);
+  font-weight: var(--fw-aux);
+}
+
+.search-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
   gap: 8px;
+}
+
+.search-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.search-actions .btn {
+  flex: 1 1 0;
+  min-height: 40px;
+}
+
+.search-submit-btn {
+  min-height: 50px;
+  min-width: 116px;
+  font-size: var(--step-0);
+  font-weight: var(--fw-title);
 }
 
 .search-shell {
   position: relative;
-  border-radius: var(--radius-sm);
+  border-radius: 12px;
   padding: 1px;
   overflow: hidden;
 }
@@ -299,7 +350,7 @@ a {
   animation: searchFlow 1.25s linear infinite;
 }
 
-.search-row input,
+.search-main input,
 .rule-form input,
 .bookmark-card input,
 .bookmark-card textarea,
@@ -308,7 +359,8 @@ a {
   width: 100%;
   border: none;
   border-radius: var(--radius-sm);
-  padding: 10px 12px;
+  padding: 13px 14px;
+  min-height: 50px;
   font: inherit;
   color: var(--text);
   background: var(--field-bg);
@@ -320,9 +372,11 @@ a {
 .search-shell input {
   position: relative;
   z-index: 1;
+  font-size: var(--step-1);
+  letter-spacing: 0.01em;
 }
 
-.search-row input::placeholder,
+.search-main input::placeholder,
 .rule-form input::placeholder,
 .bookmark-card input::placeholder,
 .bookmark-card textarea::placeholder,
@@ -332,7 +386,7 @@ a {
   font-weight: var(--fw-aux);
 }
 
-.search-row input:focus,
+.search-main input:focus,
 .rule-form input:focus,
 .bookmark-card input:focus,
 .bookmark-card textarea:focus,
@@ -432,7 +486,6 @@ a {
 .chip,
 .scope-pill,
 .tag,
-.tiny-pill,
 .compact-pill,
 .status-pill {
   color: var(--label-text);
@@ -655,19 +708,6 @@ a {
   gap: 8px;
 }
 
-.inline-check {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-muted);
-  font-size: var(--step--1);
-  font-weight: var(--fw-aux);
-}
-
-.inline-check input {
-  accent-color: var(--accent);
-}
-
 .rule-card {
   border-radius: 12px;
   padding: 10px;
@@ -691,13 +731,6 @@ a {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-}
-
-.tiny-pill {
-  padding: 3px 8px;
-  border-radius: 999px;
-  font-size: 10px;
-  font-weight: var(--fw-title);
 }
 
 .muted {
@@ -844,17 +877,11 @@ a {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(140deg, hsla(225 26% 30% / 0.6), hsla(191 82% 40% / 0.52));
-  color: hsl(196 100% 95%);
+  background: hsla(220 17% 19% / 0.72);
+  color: hsl(216 18% 74%);
   font-size: 10px;
-  font-weight: var(--fw-title);
-}
-
-.list-wrap {
-  display: grid;
-  gap: 10px;
-  padding: 10px;
-  align-content: start;
+  font-weight: 600;
+  box-shadow: inset 0 0 0 0.5px hsla(220 22% 82% / 0.18);
 }
 
 .bookmark-card {
@@ -1199,8 +1226,18 @@ a {
     padding: 14px;
   }
 
-  .search-row {
+  .search-main {
     grid-template-columns: 1fr;
+  }
+
+  .search-submit-btn {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .search-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .metric-row {
@@ -1285,6 +1322,19 @@ a {
 
   .topbar {
     padding: 10px;
+  }
+
+  .search-focus {
+    padding: 9px;
+    gap: 8px;
+  }
+
+  .search-main input {
+    min-height: 48px;
+  }
+
+  .search-actions {
+    grid-template-columns: 1fr;
   }
 
   .metric-row {

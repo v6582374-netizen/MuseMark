@@ -472,6 +472,26 @@ body {
     var(--shadow-z50);
 }
 
+.dock-row.is-draggable {
+  cursor: grab;
+}
+
+.dock-row.is-draggable:active {
+  cursor: grabbing;
+}
+
+.dock-row.is-dragging {
+  opacity: 0.55;
+  transform: scale(0.985);
+}
+
+.dock-row.is-drop-target {
+  box-shadow:
+    inset 0 0 0 1px hsla(199 90% 78% / 0.72),
+    0 0 0 1px hsla(199 90% 62% / 0.35),
+    var(--shadow-z50);
+}
+
 .dock-row-main {
   min-width: 0;
   display: flex;
@@ -491,10 +511,11 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: hsl(211 45% 86%);
+  color: hsl(216 18% 74%);
   font-size: 10px;
   font-weight: 600;
-  background: linear-gradient(145deg, hsla(224 28% 34% / 0.74), hsla(191 44% 35% / 0.58));
+  background: hsla(220 17% 19% / 0.72);
+  box-shadow: inset 0 0 0 0.5px hsla(220 22% 82% / 0.18);
 }
 
 .dock-row-copy {

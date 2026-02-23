@@ -1,3 +1,74 @@
+type FaviconCandidateInput = {
+  favIconUrl?: string;
+  url?: string;
+  domain?: string;
+};
+
+const QUICKDOCK_FALLBACK_ICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#98A2B3" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21a9 9 0 1 0 0-18a9 9 0 0 0 0 18"/><path d="M3.6 9h16.8"/><path d="M3.6 15h16.8"/><path d="M11.5 3a17 17 0 0 0 0 18"/><path d="M12.5 3a17 17 0 0 1 0 18"/></svg>';
+
+const QUICKDOCK_FALLBACK_ICON_DATA_URL = `data:image/svg+xml;utf8,${encodeURIComponent(
+  QUICKDOCK_FALLBACK_ICON_SVG
+)}`;
+
+function buildFaviconCandidates(input: FaviconCandidateInput): string[] {
+  const unique = new Set<string>();
+
+  const addCandidate = (candidate?: string) => {
+    const value = (candidate ?? "").trim();
+    if (!value) {
+      return;
+    }
+    unique.add(value);
+  };
+
+  addCandidate(input.favIconUrl);
+
+  try {
+    if (input.url) {
+      const parsed = new URL(input.url);
+      addCandidate(new URL("/favicon.ico", parsed.origin).toString());
+      addCandidate(`https://www.google.com/s2/favicons?sz=64&domain_url=${encodeURIComponent(parsed.origin)}`);
+      addCandidate(`https://icons.duckduckgo.com/ip3/${parsed.hostname}.ico`);
+    }
+  } catch {
+    // Ignore invalid URL and continue using domain candidates.
+  }
+
+  const safeDomain = (input.domain ?? "").trim();
+  if (safeDomain) {
+    addCandidate(`https://www.google.com/s2/favicons?sz=64&domain=${encodeURIComponent(safeDomain)}`);
+    addCandidate(`https://icons.duckduckgo.com/ip3/${safeDomain}.ico`);
+  }
+
+  addCandidate(QUICKDOCK_FALLBACK_ICON_DATA_URL);
+  return Array.from(unique);
+}
+
+function nextCandidateOrFallback(
+  candidates: string[],
+  currentIndex: number
+): {
+  nextSrc?: string;
+  nextIndex: number;
+  exhausted: boolean;
+} {
+  const nextIndex = currentIndex + 1;
+  if (nextIndex >= candidates.length) {
+    return {
+      nextSrc: undefined,
+      nextIndex: currentIndex,
+      exhausted: true
+    };
+  }
+
+  return {
+    nextSrc: candidates[nextIndex],
+    nextIndex,
+    exhausted: false
+  };
+}
+
 (() => {
   const PROTOCOL_VERSION = 1;
   const GLOBAL_KEY = "__musemark_content_ready__";
@@ -23,6 +94,7 @@
   };
 
   type DockMode = "collapsed" | "expanded";
+  type DockPosition = "right" | "bottom_center";
 
   type DockLayoutState = {
     mode: DockMode;
@@ -50,6 +122,7 @@
 
   type DockStatePayload = {
     enabled: boolean;
+    position?: DockPosition;
     layout: DockLayoutState;
     profiles: DockProfile[];
     pinnedIds: string[];
@@ -74,9 +147,9 @@
   let dockElements: DockElements | null = null;
   let dockEnabled = true;
   let dockMode: DockMode = "expanded";
+  let dockPosition: DockPosition = "right";
   let dockEntries: DockEntry[] = [];
   let dockPinnedIds = new Set<string>();
-  let dockProfiles: DockProfile[] = [];
   let dockActiveProfileId = "default";
   let dockFocusedIndex = 0;
   let dockSuppressedByOverlay = false;
@@ -84,6 +157,9 @@
   let dockTransitionTimer: number | undefined;
   let dockTransitionLocked = false;
   let dockContextMenu: HTMLDivElement | null = null;
+  let dockDraggingPinnedId: string | null = null;
+  let dockDropTargetPinnedId: string | null = null;
+  let dockClickSuppressedUntil = 0;
 
   const DOCK_WATERFALL_STEP_MS = 32;
 
@@ -546,9 +622,9 @@
     dockEnabled = Boolean(payload.enabled);
     dockEntries = Array.isArray(payload.entries) ? payload.entries : [];
     dockPinnedIds = new Set(Array.isArray(payload.pinnedIds) ? payload.pinnedIds : []);
-    dockProfiles = Array.isArray(payload.profiles) ? payload.profiles : [];
     dockActiveProfileId = payload.layout?.activeProfileId || "default";
     dockMode = normalizeDockMode(payload.layout?.mode) || dockMode;
+    dockPosition = normalizeDockPosition(payload.position) || dockPosition;
 
     if (!dockEnabled) {
       if (dockElements) {
@@ -575,6 +651,8 @@
 
     const root = document.createElement("div");
     root.id = "musemark-quickdock";
+    root.dataset.position = dockPosition;
+    root.classList.add(dockPosition === "bottom_center" ? "pos-bottom" : "pos-right");
     root.innerHTML = `
       <div class="anqd-controls">
         <button class="anqd-restore" type="button" title="Show Dock (Cmd/Ctrl+Shift+K)" aria-label="Show Dock"></button>
@@ -636,6 +714,23 @@
         display: flex;
         align-items: center;
         justify-content: center;
+      }
+      #musemark-quickdock.pos-bottom {
+        right: auto;
+        top: auto;
+        left: 50%;
+        bottom: 16px;
+        transform: translateX(-50%);
+        width: auto;
+        max-width: min(92vw, 920px);
+        flex-direction: row;
+        align-items: center;
+        gap: 12px;
+      }
+      #musemark-quickdock.pos-bottom .anqd-controls {
+        width: auto;
+        min-height: 0;
+        flex: 0 0 auto;
       }
       #musemark-quickdock .anqd-restore {
         position: relative;
@@ -744,26 +839,50 @@
         overflow: visible;
         transition: opacity 140ms ease, transform 140ms ease;
       }
-      #musemark-quickdock.is-collapsed .anqd-rail {
+      #musemark-quickdock.pos-bottom .anqd-rail {
+        width: auto;
+        max-width: min(92vw, 860px);
+        overflow: hidden;
+      }
+      #musemark-quickdock.pos-right.is-collapsed .anqd-rail {
         opacity: 0;
         transform: translateX(16px) scale(0.96);
         pointer-events: none;
       }
-      #musemark-quickdock.is-collapsed .anqd-restore {
+      #musemark-quickdock.pos-bottom.is-collapsed .anqd-rail {
+        opacity: 0;
+        transform: translateY(12px) scale(0.96);
+        pointer-events: none;
+        max-width: 0;
+      }
+      #musemark-quickdock.pos-right.is-collapsed .anqd-restore,
+      #musemark-quickdock.pos-bottom.is-collapsed .anqd-restore {
         display: inline-flex;
       }
-      #musemark-quickdock.is-collapsed .anqd-hide {
+      #musemark-quickdock.pos-right.is-collapsed .anqd-hide,
+      #musemark-quickdock.pos-bottom.is-collapsed .anqd-hide {
         display: none;
       }
       #musemark-quickdock .anqd-list {
         display: flex;
         flex-direction: column;
         align-items: center;
-        gap: 6px;
+        gap: 24px;
         max-height: min(72vh, 760px);
         overflow-y: auto;
         width: 100%;
         padding: 0;
+      }
+      #musemark-quickdock.pos-bottom .anqd-list {
+        flex-direction: row;
+        align-items: center;
+        gap: 24px;
+        width: auto;
+        max-width: min(92vw, 820px);
+        max-height: none;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding: 2px 2px;
       }
       #musemark-quickdock .anqd-list::-webkit-scrollbar {
         width: 0;
@@ -795,13 +914,33 @@
           calc(var(--idx, 0) * 32ms),
           0ms;
       }
-      #musemark-quickdock.is-opening .anqd-item,
-      #musemark-quickdock.is-closing .anqd-item {
+      #musemark-quickdock.pos-right.is-opening .anqd-item,
+      #musemark-quickdock.pos-right.is-closing .anqd-item {
         opacity: 0;
         transform: translateY(-8px) scale(0.96);
       }
+      #musemark-quickdock.pos-bottom.is-opening .anqd-item,
+      #musemark-quickdock.pos-bottom.is-closing .anqd-item {
+        opacity: 0;
+        transform: translateY(8px) scale(0.96);
+      }
       #musemark-quickdock .anqd-item.selected {
         box-shadow: 0 0 22px rgba(255, 255, 255, 0.2);
+      }
+      #musemark-quickdock .anqd-item[data-pinned="true"] {
+        cursor: grab;
+      }
+      #musemark-quickdock .anqd-item[data-pinned="true"]:active {
+        cursor: grabbing;
+      }
+      #musemark-quickdock .anqd-item.is-dragging {
+        opacity: 0.58;
+        transform: scale(0.96);
+      }
+      #musemark-quickdock .anqd-item.is-drop-target {
+        box-shadow:
+          inset 0 0 0 1px rgba(182, 223, 255, 0.78),
+          0 0 0 1px rgba(143, 202, 255, 0.44);
       }
       #musemark-quickdock .anqd-item img {
         width: 100%;
@@ -817,9 +956,11 @@
         align-items: center;
         justify-content: center;
         border-radius: inherit;
-        font-size: 24px;
-        font-weight: 700;
-        color: rgba(249, 251, 255, 0.9);
+        font-size: 13px;
+        font-weight: 600;
+        color: rgba(170, 178, 193, 0.94);
+        background: rgba(32, 37, 47, 0.78);
+        box-shadow: inset 0 0 0 0.8px rgba(195, 203, 220, 0.16);
         opacity: 1;
       }
       #musemark-quickdock .anqd-slot {
@@ -896,8 +1037,13 @@
         background: rgba(219, 225, 236, 0.88);
       }
       @media (max-width: 960px) {
-        #musemark-quickdock {
+        #musemark-quickdock.pos-right {
           right: 0;
+        }
+        #musemark-quickdock.pos-bottom {
+          bottom: 12px;
+          max-width: 94vw;
+          gap: 10px;
         }
         #musemark-quickdock .anqd-hide,
         #musemark-quickdock .anqd-restore {
@@ -914,6 +1060,14 @@
           width: 42px;
           border-radius: 0;
           padding: 0;
+        }
+        #musemark-quickdock.pos-bottom .anqd-rail {
+          width: auto;
+          max-width: calc(94vw - 46px);
+        }
+        #musemark-quickdock.pos-bottom .anqd-list {
+          max-width: calc(94vw - 46px);
+          gap: 18px;
         }
         #musemark-quickdock .anqd-item {
           width: 27px;
@@ -932,6 +1086,10 @@
     if (!dockElements) {
       return;
     }
+
+    dockElements.root.dataset.position = dockPosition;
+    dockElements.root.classList.toggle("pos-right", dockPosition === "right");
+    dockElements.root.classList.toggle("pos-bottom", dockPosition === "bottom_center");
 
     const isTransitioning =
       dockElements.root.classList.contains("is-opening") || dockElements.root.classList.contains("is-closing");
@@ -962,17 +1120,46 @@
       const row = document.createElement("button");
       row.type = "button";
       row.className = "anqd-item";
+      row.dataset.entryId = entry.id;
       row.style.setProperty("--idx", String(index));
       if (index === dockFocusedIndex) {
         row.classList.add("selected");
       }
       const shortcut = getDockShortcutLabel(index);
       row.title = `${entry.title}\nShortcut: Ctrl+${shortcut}`;
+      const isPinnedEntry = isPinnedDockEntry(entry);
+      row.dataset.pinned = isPinnedEntry ? "true" : "false";
 
-      if (entry.kind === "bookmark" && entry.favIconUrl) {
+      if (entry.kind === "bookmark") {
+        const candidates = buildFaviconCandidates({
+          favIconUrl: entry.favIconUrl,
+          url: entry.url,
+          domain: entry.domain
+        });
         const img = document.createElement("img");
-        img.src = entry.favIconUrl;
         img.alt = entry.domain || entry.title;
+        img.referrerPolicy = "no-referrer";
+
+        let iconIndex = 0;
+        let exhausted = false;
+        img.src = candidates[iconIndex] ?? "";
+        img.addEventListener("error", () => {
+          if (exhausted) {
+            return;
+          }
+          const next = nextCandidateOrFallback(candidates, iconIndex);
+          if (next.exhausted || !next.nextSrc) {
+            exhausted = true;
+            img.remove();
+            const fallback = document.createElement("div");
+            fallback.className = "anqd-fallback";
+            fallback.textContent = (entry.domain || entry.title || "?").slice(0, 1).toUpperCase();
+            row.appendChild(fallback);
+            return;
+          }
+          iconIndex = next.nextIndex;
+          img.src = next.nextSrc;
+        });
         row.appendChild(img);
       } else {
         const fallback = document.createElement("div");
@@ -986,7 +1173,7 @@
       slot.textContent = shortcut;
       row.appendChild(slot);
 
-      if (entry.kind === "bookmark" && (entry.pinned || dockPinnedIds.has(entry.id))) {
+      if (isPinnedEntry) {
         const pinned = document.createElement("span");
         pinned.className = "anqd-pinned";
         pinned.title = "Pinned";
@@ -995,12 +1182,64 @@
 
       if (entry.kind === "bookmark") {
         row.addEventListener("contextmenu", (event) => {
+          if (dockDraggingPinnedId) {
+            event.preventDefault();
+            return;
+          }
           event.preventDefault();
           showDockContextMenu(entry, event.clientX, event.clientY);
         });
       }
 
+      if (isPinnedEntry) {
+        row.draggable = true;
+        row.addEventListener("dragstart", (event) => {
+          dockDraggingPinnedId = entry.id;
+          dockDropTargetPinnedId = null;
+          hideDockContextMenu();
+          clearDockDropTargetStyles();
+          row.classList.add("is-dragging");
+          if (event.dataTransfer) {
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", entry.id);
+          }
+        });
+
+        row.addEventListener("dragover", (event) => {
+          if (!dockDraggingPinnedId || dockDraggingPinnedId === entry.id) {
+            return;
+          }
+          event.preventDefault();
+          if (event.dataTransfer) {
+            event.dataTransfer.dropEffect = "move";
+          }
+          if (dockDropTargetPinnedId === entry.id) {
+            return;
+          }
+          dockDropTargetPinnedId = entry.id;
+          clearDockDropTargetStyles();
+          row.classList.add("is-drop-target");
+        });
+
+        row.addEventListener("drop", (event) => {
+          if (!dockDraggingPinnedId || dockDraggingPinnedId === entry.id) {
+            return;
+          }
+          event.preventDefault();
+          const sourceId = dockDraggingPinnedId;
+          dockClickSuppressedUntil = Date.now() + 350;
+          void reorderPinnedDockEntries(sourceId, entry.id);
+        });
+
+        row.addEventListener("dragend", () => {
+          cleanupDockDragState();
+        });
+      }
+
       row.addEventListener("click", () => {
+        if (Date.now() < dockClickSuppressedUntil) {
+          return;
+        }
         dockFocusedIndex = index;
         renderDockEntries();
         void openDockEntry(entry);
@@ -1008,6 +1247,104 @@
 
       list.appendChild(row);
     });
+  }
+
+  function isPinnedDockEntry(entry: DockEntry): boolean {
+    return entry.kind === "bookmark" && (dockPinnedIds.has(entry.id) || Boolean(entry.pinned));
+  }
+
+  function clearDockDropTargetStyles(): void {
+    if (!dockElements) {
+      return;
+    }
+    dockElements.list.querySelectorAll(".anqd-item.is-drop-target").forEach((node) => {
+      node.classList.remove("is-drop-target");
+    });
+  }
+
+  function cleanupDockDragState(): void {
+    if (!dockElements) {
+      dockDraggingPinnedId = null;
+      dockDropTargetPinnedId = null;
+      return;
+    }
+    dockElements.list.querySelectorAll(".anqd-item.is-dragging, .anqd-item.is-drop-target").forEach((node) => {
+      node.classList.remove("is-dragging", "is-drop-target");
+    });
+    dockDraggingPinnedId = null;
+    dockDropTargetPinnedId = null;
+  }
+
+  function buildDockEntriesWithPinnedOrder(orderedPinnedIds: string[]): DockEntry[] {
+    const orderedPinnedSet = new Set(orderedPinnedIds);
+    const pinnedEntries = dockEntries.filter((entry) => {
+      return (
+        entry.kind === "bookmark" && (orderedPinnedSet.has(entry.id) || dockPinnedIds.has(entry.id) || Boolean(entry.pinned))
+      );
+    });
+    const pinnedById = new Map(pinnedEntries.map((entry) => [entry.id, entry]));
+    const orderedPinnedEntries: DockEntry[] = [];
+    const seen = new Set<string>();
+
+    for (const bookmarkId of orderedPinnedIds) {
+      const item = pinnedById.get(bookmarkId);
+      if (!item || seen.has(bookmarkId)) {
+        continue;
+      }
+      seen.add(bookmarkId);
+      orderedPinnedEntries.push(item);
+    }
+
+    for (const item of pinnedEntries) {
+      if (seen.has(item.id)) {
+        continue;
+      }
+      seen.add(item.id);
+      orderedPinnedEntries.push(item);
+    }
+
+    let pinnedIndex = 0;
+    return dockEntries.map((entry) => {
+      if (entry.kind === "bookmark" && (orderedPinnedSet.has(entry.id) || dockPinnedIds.has(entry.id) || Boolean(entry.pinned))) {
+        const next = orderedPinnedEntries[pinnedIndex];
+        pinnedIndex += 1;
+        return next ?? entry;
+      }
+      return entry;
+    });
+  }
+
+  async function reorderPinnedDockEntries(sourceId: string, targetId: string): Promise<void> {
+    const pinnedIds = dockEntries.filter(isPinnedDockEntry).map((entry) => entry.id);
+    const sourceIndex = pinnedIds.indexOf(sourceId);
+    const targetIndex = pinnedIds.indexOf(targetId);
+    if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) {
+      cleanupDockDragState();
+      return;
+    }
+
+    const nextPinnedIds = [...pinnedIds];
+    const [movingId] = nextPinnedIds.splice(sourceIndex, 1);
+    nextPinnedIds.splice(targetIndex, 0, movingId);
+    dockPinnedIds = new Set(nextPinnedIds);
+    dockEntries = buildDockEntriesWithPinnedOrder(nextPinnedIds);
+    cleanupDockDragState();
+    renderDockEntries();
+
+    try {
+      const response = await sendRuntimeMessage<{ pinned: true; profileId: string; pinnedIds: string[] }>("quickDock/reorderPinned", {
+        orderedIds: nextPinnedIds,
+        profileId: dockActiveProfileId
+      });
+      if (Array.isArray(response.pinnedIds) && response.pinnedIds.length > 0) {
+        dockPinnedIds = new Set(response.pinnedIds);
+        dockEntries = buildDockEntriesWithPinnedOrder(response.pinnedIds);
+        renderDockEntries();
+      }
+      await refreshQuickDock();
+    } catch {
+      await refreshQuickDock();
+    }
   }
 
   async function setDockMode(mode: DockMode, persist: boolean): Promise<void> {
@@ -1264,6 +1601,16 @@
     }
     if (mode === "expanded" || mode === "peek") {
       return "expanded";
+    }
+    return undefined;
+  }
+
+  function normalizeDockPosition(position: unknown): DockPosition | undefined {
+    if (position === "bottom_center") {
+      return "bottom_center";
+    }
+    if (position === "right") {
+      return "right";
     }
     return undefined;
   }
